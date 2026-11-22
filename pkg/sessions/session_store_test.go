@@ -10,8 +10,10 @@ import (
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/sessions"
 	sessionscookie "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/sessions/cookie"
+	memorystore "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/sessions/memory"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/sessions/persistence"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/sessions/redis"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/sessions/strict"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -86,6 +88,64 @@ var _ = Describe("NewSessionStore", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(Equal("unknown session store type 'invalid-type'"))
 			Expect(ss).To(BeNil())
+		})
+	})
+
+	Context("with type 'memory'", func() {
+		BeforeEach(func() {
+			opts.Type = options.MemorySessionStoreType
+		})
+
+		It("creates a persistence.Manager that wraps a memory.SessionStore", func() {
+			ss, err := sessions.NewSessionStore(opts, cookieOpts)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ss).To(BeAssignableToTypeOf(&persistence.Manager{}))
+			Expect(ss.(*persistence.Manager).Store).To(BeAssignableToTypeOf(&memorystore.SessionStore{}))
+		})
+	})
+
+	Context("with strict semantics enabled", func() {
+		BeforeEach(func() {
+			opts.Type = options.MemorySessionStoreType
+			opts.Strict.Enabled = true
+			opts.Strict.RevocationEnabled = true
+		})
+
+		It("wraps the backend in a strict.Store and preserves the default-off behaviour otherwise", func() {
+			ss, err := sessions.NewSessionStore(opts, cookieOpts)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ss).To(BeAssignableToTypeOf(&strict.Store{}))
+			Expect(ss.(*strict.Store).UnavailablePolicyName()).To(Equal(options.UnavailablePolicyFailClosed))
+		})
+
+		It("rejects an invalid unavailable policy", func() {
+			opts.Strict.UnavailablePolicy = "nonsense"
+			_, err := sessions.NewSessionStore(opts, cookieOpts)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("invalid session-unavailable-policy"))
+		})
+	})
+
+	Context("with strict semantics and the cookie backend", func() {
+		It("is rejected because strict semantics need a server-side store", func() {
+			opts.Type = options.CookieSessionStoreType
+			opts.Strict.Enabled = true
+			_, err := sessions.NewSessionStore(opts, cookieOpts)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("requires a server-side session backend"))
+		})
+	})
+
+	Context("with strict semantics disabled (default)", func() {
+		BeforeEach(func() {
+			opts.Type = options.MemorySessionStoreType
+		})
+
+		It("returns the unwrapped backend, keeping legacy behaviour", func() {
+			ss, err := sessions.NewSessionStore(opts, cookieOpts)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ss).To(BeAssignableToTypeOf(&persistence.Manager{}))
+			Expect(ss).NotTo(BeAssignableToTypeOf(&strict.Store{}))
 		})
 	})
 })

@@ -12,6 +12,7 @@ data in one of the available session storage backends.
 At present the available backends are (as passed to `--session-store-type`):
 - [cookie](#cookie-storage) (default)
 - [redis](#redis-storage)
+- [memory](#memory-storage)
 
 ### Cookie Storage
 
@@ -97,3 +98,121 @@ Note that flags `--redis-use-sentinel=true` and `--redis-use-cluster=true` are m
 Note, if Redis timeout option is set to non-zero, the `--redis-connection-idle-timeout` 
 must be less than [Redis timeout option](https://redis.io/docs/reference/clients/#client-timeouts). For example: if either redis.conf includes 
 `timeout 15` or using `CONFIG SET timeout 15` the `--redis-connection-idle-timeout` must be at least `--redis-connection-idle-timeout=14`
+
+### Memory Storage
+
+The Memory storage backend (`--session-store-type=memory`) keeps encrypted
+sessions in a per-process map. It uses the same ticket/cookie machinery as the
+Redis backend (the `persistence.Manager`), so its cookie format is identical,
+but:
+
+- all state is lost when the process restarts;
+- state is **not shared between replicas** — each process keeps its own map, so
+  a session created on one replica is invisible to the others.
+
+It is intended for single-replica deployments, local development and tests.
+Multi-replica semantics require a shared backend (Redis).
+
+### Strict session semantics
+
+Historically every session-loading error — including a transient Redis timeout
+— was treated the same as "not logged in": the session was cleared and the user
+was redirected to sign in. A short Redis blip during a failover could therefore
+sign out a whole fleet. Strict session semantics separate *store unavailability*
+from *unauthenticated*, make logout reliable across replicas, and distinguish
+natural expiry from deliberate revocation.
+
+Strict semantics are **off by default** and enabled with
+`--session-strict-semantics`. When disabled, behaviour is unchanged from
+previous versions. The existing session serialization and ticket cookie format
+are preserved, so upgrading does not invalidate existing sessions.
+
+#### Error taxonomy
+
+Every session error is classified into one of:
+
+| Classification | Meaning | Default handling |
+|---|---|---|
+| unauthenticated | no session cookie was presented | normal sign-in redirect |
+| not_found | ticket present but no session behind it (natural TTL expiry) | sign-in redirect, no alarm, no clear |
+| unavailable | store timeout / connection failure / failover | degradation policy (below) |
+| corrupt | stored data could not be decrypted or decoded | session destroyed + audit record |
+| revoked | session deliberately invalidated with a reason | sign-in redirect, audit reason retained |
+
+An `unavailable` read is **never** converted into a sign-out. The session is
+left untouched and, once the store recovers, the same cookie works again.
+
+#### Unavailable policy
+
+`--session-unavailable-policy` selects what happens to a request whose session
+read cannot be answered because the store is unavailable:
+
+- `fail-closed` (default): the request is rejected with `503 Service
+  Unavailable` and a `Retry-After` header. No authentication decision is made
+  on uncertainty.
+- `fail-open-stale`: the request proceeds using the last known good session
+  snapshot cached in the process, with the request scope marked
+  `SessionDegraded`. A degraded session is neither refreshed nor written back
+  for the duration of the outage, and snapshots expire independently of the
+  store (bounded by `--cookie-refresh`). If no snapshot exists, the request
+  still fails closed with 503 — requests are never allowed without an identity.
+
+#### Retries and reliable logout
+
+Store operations are retried with exponential backoff (full jitter) up to
+`--session-operation-max-retries`, each attempt bounded by
+`--session-operation-timeout`. Only `unavailable` errors are retried;
+not-found/corrupt/revoked are returned immediately.
+
+Logout (`Clear`) has a separate, larger budget
+(`--session-logout-max-retries`) and a strict ordering:
+
+1. a shared revocation record is written first;
+2. the session key is deleted from the store;
+3. only then is the cookie removed.
+
+If the store cannot be confirmed (e.g. during a primary/replica switchover),
+logout returns an explicit error and **keeps the cookie**, so the user can
+retry instead of believing they signed out while the session still exists.
+The revocation record also acts as a second line of defence: even if the key
+delete is delayed, a ticket matching a live revocation record is rejected on
+every replica.
+
+#### Revocation vs expiry
+
+With `--session-revocation-enabled`, logout and administrative/provider-driven
+invalidations write a revocation record (Redis key
+`oauth2-proxy:revocation:<ticketID>`) with a TTL of
+`--session-revocation-ttl` (default: the cookie expire duration). Because the
+record lives in the shared store, revocation is effective on every replica.
+Revocation reasons are recorded separately from natural TTL expiry:
+
+`user-logout`, `admin-revoke`, `upstream-userinfo-changed`,
+`refresh-token-revoked`, `corrupt-destroyed`.
+
+Natural expiry writes no revocation record, so the audit trail keeps the two
+events distinct.
+
+#### Upstream user-info change propagation
+
+By default a session keeps its embedded user information (groups, claims) until
+it expires. `--session-userinfo-stale-max-age` bounds how stale that snapshot
+may be: once it exceeds the age, the next request re-validates the identity
+upstream. If the upstream rejects it (e.g. permissions were withdrawn), the
+session is revoked with reason `upstream-userinfo-changed` instead of waiting
+for expiry. If the upstream check itself cannot complete, the request degrades
+as `unavailable` — a session is never revoked on uncertainty.
+
+#### Reference of flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--session-strict-semantics` | `false` | enable the strict wrapper |
+| `--session-unavailable-policy` | `fail-closed` | `fail-closed` or `fail-open-stale` |
+| `--session-operation-timeout` | `2s` | per-attempt store operation timeout |
+| `--session-operation-max-retries` | `3` | retries for ordinary load/save operations |
+| `--session-logout-max-retries` | `5` | retry budget for logout writes |
+| `--session-revocation-enabled` | `false` | shared revocation records |
+| `--session-revocation-ttl` | cookie expire | retention of revocation records |
+| `--session-userinfo-stale-max-age` | `0` (disabled) | max age of embedded user info |
+

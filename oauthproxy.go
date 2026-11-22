@@ -143,6 +143,20 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		return nil, fmt.Errorf("error initialising provider: %v", err)
 	}
 
+	// Wire the upstream user-info validator into the strict session store when
+	// both the feature and the capability are present. Built before the
+	// provider, the store accepts the callback via a setter rather than a
+	// constructor argument.
+	if opts.Session.Strict.Enabled && opts.Session.Strict.UserInfoStaleMaxAge > 0 {
+		if setter, ok := sessionStore.(interface {
+			SetUserInfoValidator(func(ctx context.Context, s *sessionsapi.SessionState) (bool, error))
+		}); ok {
+			setter.SetUserInfoValidator(func(ctx context.Context, s *sessionsapi.SessionState) (bool, error) {
+				return provider.ValidateSession(ctx, s), nil
+			})
+		}
+	}
+
 	pageWriter, err := pagewriter.NewWriter(pagewriter.Opts{
 		TemplatesPath:    opts.Templates.Path,
 		CustomLogo:       opts.Templates.CustomLogo,
@@ -793,6 +807,16 @@ func (p *OAuthProxy) SignOut(rw http.ResponseWriter, req *http.Request) {
 	err = p.ClearSessionCookie(rw, req)
 	if err != nil {
 		logger.Errorf("Error clearing session cookie: %v", err)
+		// Under strict session semantics a store outage means the logout could
+		// not be confirmed. Report a retryable 503 rather than a generic 500 so
+		// the user understands the action can be retried and, critically, does
+		// not believe they are signed out while the session still exists.
+		if errors.Is(err, sessionsapi.ErrStoreUnavailable) {
+			rw.Header().Set("Retry-After", "2")
+			p.ErrorPage(rw, req, http.StatusServiceUnavailable,
+				"sign out could not be confirmed because the session store is temporarily unavailable, please try again")
+			return
+		}
 		p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
 		return
 	}

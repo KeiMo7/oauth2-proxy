@@ -40,7 +40,10 @@ func NewRedisSessionStore(opts *options.SessionOptions, cookieOpts *options.Cook
 func (store *SessionStore) Save(ctx context.Context, key string, value []byte, exp time.Duration) error {
 	err := store.Client.Set(ctx, key, value, exp)
 	if err != nil {
-		return fmt.Errorf("error saving redis session: %v", err)
+		// A failed write must be distinguishable from "not logged in": it is a
+		// transient storage condition that callers can retry and must never use
+		// as a reason to destroy an existing session.
+		return fmt.Errorf("error saving redis session: %w: %v", sessions.ErrStoreUnavailable, err)
 	}
 	return nil
 }
@@ -50,9 +53,14 @@ func (store *SessionStore) Save(ctx context.Context, key string, value []byte, e
 func (store *SessionStore) Load(ctx context.Context, key string) ([]byte, error) {
 	value, err := store.Client.Get(ctx, key)
 	if err == redis.Nil {
-		return nil, fmt.Errorf("session does not exist")
+		// Ticket present but no session behind it: natural expiry / never
+		// existed — classify as not-found rather than a storage failure.
+		return nil, fmt.Errorf("%w: %s", sessions.ErrSessionNotFound, key)
 	} else if err != nil {
-		return nil, fmt.Errorf("error loading redis session: %v", err)
+		// Timeouts, connection resets, failover/READONLY replies and any other
+		// server-side failure mean the authentication state is unknown, not
+		// that the user is unauthenticated.
+		return nil, fmt.Errorf("error loading redis session: %w: %v", sessions.ErrStoreUnavailable, err)
 	}
 
 	return value, nil
@@ -63,7 +71,7 @@ func (store *SessionStore) Load(ctx context.Context, key string) ([]byte, error)
 func (store *SessionStore) Clear(ctx context.Context, key string) error {
 	err := store.Client.Del(ctx, key)
 	if err != nil {
-		return fmt.Errorf("error clearing the session from redis: %v", err)
+		return fmt.Errorf("error clearing the session from redis: %w: %v", sessions.ErrStoreUnavailable, err)
 	}
 	return nil
 }

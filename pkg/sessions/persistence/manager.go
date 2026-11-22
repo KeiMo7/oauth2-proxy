@@ -92,6 +92,36 @@ func (m *Manager) Clear(rw http.ResponseWriter, req *http.Request) error {
 	})
 }
 
+// ClearStoreBeforeCookie is the reliable-logout variant of Clear: it deletes
+// the session from the shared Store FIRST and only removes the cookie once the
+// deletion succeeds. If the Store operation fails (e.g. during a Redis
+// primary/replica failover) the cookie is deliberately kept so the caller can
+// retry the logout instead of reporting a success while the session still
+// exists. When no ticket cookie is present the cookie is cleared and nil is
+// returned, matching Clear's no-cookie behaviour.
+func (m *Manager) ClearStoreBeforeCookie(rw http.ResponseWriter, req *http.Request) error {
+	tckt, err := decodeTicketFromRequest(req, m.Options)
+	if err != nil {
+		if err == http.ErrNoCookie {
+			// Nothing to delete server-side; just make sure the cookie is gone.
+			(&ticket{options: m.Options}).clearCookie(rw, req)
+			return nil
+		}
+		// Do not clear the cookie on a decode error here: the strict wrapper
+		// treats this as corruption and owns the audit/destroy decision.
+		return fmt.Errorf("error decoding ticket to clear session: %v", err)
+	}
+
+	if err := tckt.clearSession(func(key string) error {
+		return m.Store.Clear(req.Context(), key)
+	}); err != nil {
+		// Keep the cookie: a retry still carries the ticket.
+		return err
+	}
+	tckt.clearCookie(rw, req)
+	return nil
+}
+
 // VerifyConnection validates the underlying store is ready and connected
 func (m *Manager) VerifyConnection(ctx context.Context) error {
 	return m.Store.VerifyConnection(ctx)

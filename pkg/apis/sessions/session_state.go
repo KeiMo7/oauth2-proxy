@@ -32,6 +32,12 @@ type SessionState struct {
 	// Additional claims
 	AdditionalClaims map[string]interface{} `msgpack:"ac,omitempty"`
 
+	// UserInfoSnapshotAt records when the embedded user information (groups,
+	// claims, ...) was last confirmed against the upstream identity provider.
+	// Zero in sessions encoded by older versions (msgpack omitempty), which is
+	// treated as "age unknown" and leaves old sessions fully valid.
+	UserInfoSnapshotAt *time.Time `msgpack:"uis,omitempty"`
+
 	// Internal helpers, not serialized
 	Clock     func() time.Time `msgpack:"-"` // override for time.Now, for testing
 	Lock      Lock             `msgpack:"-"`

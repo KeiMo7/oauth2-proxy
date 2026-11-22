@@ -159,6 +159,19 @@ func decodeTicketFromRequest(req *http.Request, cookieOpts *options.Cookie) (*ti
 	return decodeTicket(string(val), cookieOpts)
 }
 
+// TicketIDFromRequest decodes the session ticket carried by the request and
+// returns its stable storage ID. It returns http.ErrNoCookie when the request
+// carries no session cookie. It is exported so that the strict-semantics
+// wrapper (which composes a persistence.Manager) can key revocation records
+// and degraded snapshots by the same ticket ID the stores use internally.
+func TicketIDFromRequest(req *http.Request, cookieOpts *options.Cookie) (string, error) {
+	tckt, err := decodeTicketFromRequest(req, cookieOpts)
+	if err != nil {
+		return "", err
+	}
+	return tckt.id, nil
+}
+
 // saveSession encodes the SessionState with the ticket's secret and persists
 // it to disk via the passed saveFunc.
 func (t *ticket) saveSession(s *sessions.SessionState, saver saveFunc) error {
@@ -180,16 +193,23 @@ func (t *ticket) saveSession(s *sessions.SessionState, saver saveFunc) error {
 func (t *ticket) loadSession(loader loadFunc, initLock initLockFunc) (*sessions.SessionState, error) {
 	ciphertext, err := loader(t.id)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load the session state with the ticket: %v", err)
+		// Wrap with %w so classified sentinel errors (ErrStoreUnavailable,
+		// ErrSessionNotFound, ...) remain detectable via errors.Is by the
+		// strict-semantics wrapper above.
+		return nil, fmt.Errorf("failed to load the session state with the ticket: %w", err)
 	}
 	c, err := t.makeCipher()
 	if err != nil {
-		return nil, err
+		// A cipher built from the ticket secret failing means the ticket or its
+		// secret is unusable; classify as corrupt rather than a store error.
+		return nil, fmt.Errorf("%w: %v", sessions.ErrSessionCorrupt, err)
 	}
 
 	sessionState, err := sessions.DecodeSessionState(ciphertext, c, false)
 	if err != nil {
-		return nil, err
+		// The store returned bytes but they cannot be decrypted or decoded:
+		// the session payload is corrupt, not the connection.
+		return nil, fmt.Errorf("%w: %v", sessions.ErrSessionCorrupt, err)
 	}
 	lock := initLock(t.id)
 	sessionState.Lock = lock

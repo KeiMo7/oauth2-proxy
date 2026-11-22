@@ -15,6 +15,10 @@ type Client interface {
 	Set(ctx context.Context, key string, value []byte, expiration time.Duration) error
 	Del(ctx context.Context, key string) error
 	Ping(ctx context.Context) error
+	// UniversalClient exposes the underlying go-redis client for components
+	// that need direct key/value access on the same connection pool (e.g. the
+	// strict-semantics revocation records).
+	UniversalClient() redis.UniversalClient
 }
 
 var _ Client = (*client)(nil)
@@ -49,6 +53,10 @@ func (c *client) Ping(ctx context.Context) error {
 	return c.Client.Ping(ctx).Err()
 }
 
+func (c *client) UniversalClient() redis.UniversalClient {
+	return c.Client
+}
+
 var _ Client = (*clusterClient)(nil)
 
 type clusterClient struct {
@@ -79,4 +87,8 @@ func (c *clusterClient) Lock(key string) sessions.Lock {
 
 func (c *clusterClient) Ping(ctx context.Context) error {
 	return c.ClusterClient.Ping(ctx).Err()
+}
+
+func (c *clusterClient) UniversalClient() redis.UniversalClient {
+	return c.ClusterClient
 }

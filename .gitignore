@@ -43,3 +43,6 @@ _testmain.go
 # vi Dockerfile.dev
 # docker build -f Dockerfile.dev .
 Dockerfile.dev
+
+# Load-test harness build output
+artifacts/loadtest/bin/

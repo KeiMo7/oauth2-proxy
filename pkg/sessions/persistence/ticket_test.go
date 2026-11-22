@@ -129,7 +129,9 @@ var _ = Describe("Session Ticket Tests", func() {
 					return &sessions.NoOpLock{}
 				})
 			Expect(data).To(BeNil())
-			Expect(err).To(MatchError(errors.New("failed to load the session state with the ticket: load error")))
+			// Match on the message string: the error now wraps the underlying
+			// error with %w so classified sentinel errors survive errors.Is.
+			Expect(err).To(MatchError(ContainSubstring("failed to load the session state with the ticket: load error")))
 		})
 	})
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/justinas/alice"
 	middlewareapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/middleware"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options"
 	sessionsapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/sessions"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/providers"
@@ -92,6 +93,31 @@ func NewStoredSessionLoader(opts *StoredSessionLoaderOptions) alice.Constructor 
 	return ss.loadSession
 }
 
+// strictStore is the optional capability surface implemented by the strict
+// session semantics wrapper. Presence of this interface switches the loader
+// onto the classified-error path; ordinary stores (legacy behaviour) do not
+// implement it and keep their original handling.
+type strictStore interface {
+	// DegradedSnapshot returns a last-known-good session for ticketID when the
+	// store is unavailable and fail-open-stale is configured.
+	DegradedSnapshot(ticketID string) (*sessionsapi.SessionState, bool)
+	// TicketID resolves the ticket ID carried by the request.
+	TicketID(req *http.Request) (string, error)
+}
+
+// policyReader is implemented by the strict wrapper to report its configured
+// unavailable policy without the middleware importing the strict package.
+type policyReader interface {
+	UnavailablePolicyName() string
+}
+
+// revoker is the strict-store capability to invalidate a session with an
+// explicit audit reason. It mirrors strict.Revoker through a local interface to
+// avoid an import cycle (the strict package already depends on apis/sessions).
+type revoker interface {
+	Revoke(req *http.Request, session *sessionsapi.SessionState, reason sessionsapi.RevocationReason) error
+}
+
 // storedSessionLoader is responsible for loading sessions from cookie
 // identified sessions in the session store.
 type storedSessionLoader struct {
@@ -99,6 +125,21 @@ type storedSessionLoader struct {
 	refreshPeriod    time.Duration
 	sessionRefresher func(context.Context, *sessionsapi.SessionState) (bool, error)
 	sessionValidator func(context.Context, *sessionsapi.SessionState) bool
+}
+
+// strictEnabled reports whether the wrapped store provides strict semantics.
+func (s *storedSessionLoader) strictEnabled() (strictStore, bool) {
+	st, ok := s.store.(strictStore)
+	return st, ok
+}
+
+// unavailablePolicy returns the configured degradation policy, defaulting to
+// fail-closed when the store does not expose one.
+func (s *storedSessionLoader) unavailablePolicy(st strictStore) string {
+	if pr, ok := st.(policyReader); ok {
+		return pr.UnavailablePolicyName()
+	}
+	return options.UnavailablePolicyFailClosed
 }
 
 // loadSession attempts to load a session as identified by the request cookies.
@@ -115,14 +156,38 @@ func (s *storedSessionLoader) loadSession(next http.Handler) http.Handler {
 			return
 		}
 
+		st, strict := s.strictEnabled()
+
 		session, err := s.getValidatedSession(rw, req)
-		if err != nil && !errors.Is(err, http.ErrNoCookie) {
-			// In the case when there was an error loading the session,
-			// we should clear the session
+		if err == nil {
+			scope.Session = session
+			next.ServeHTTP(rw, req)
+			return
+		}
+
+		if strict {
+			// stop is true when the response is already complete (503) and the
+			// request must not continue down the chain.
+			if stop := s.handleStrictError(rw, req, st, err, scope); stop {
+				return
+			}
+			// If the degradation policy attached a last-known-good snapshot,
+			// mark the request context so downstream code skips refresh/write.
+			if scope.SessionDegraded {
+				req = req.WithContext(withDegraded(req.Context()))
+			}
+			// Classified conditions (not-found/revoked/corrupt/no-cookie, or a
+			// degraded snapshot) fall through: scope.Session is either nil
+			// (sign-in redirect) or a degraded session (request continues).
+			next.ServeHTTP(rw, req)
+			return
+		}
+
+		if !errors.Is(err, http.ErrNoCookie) {
+			// Legacy behaviour: any load error clears the session cookie.
 			logger.Errorf("Error loading cookied session: %v, removing session", err)
-			err = s.store.Clear(rw, req)
-			if err != nil {
-				logger.Errorf("Error removing session: %v", err)
+			if clearErr := s.store.Clear(rw, req); clearErr != nil {
+				logger.Errorf("Error removing session: %v", clearErr)
 			}
 		}
 
@@ -132,6 +197,79 @@ func (s *storedSessionLoader) loadSession(next http.Handler) http.Handler {
 	})
 }
 
+// handleStrictError applies the degradation policy to a classified session
+// error. It returns true when the response is fully written and the caller must
+// stop processing (the fail-closed 503 path); false means the request should
+// continue with scope.Session either nil or a degraded snapshot.
+func (s *storedSessionLoader) handleStrictError(rw http.ResponseWriter, req *http.Request, st strictStore, err error, scope *middlewareapi.RequestScope) bool {
+	kind := sessionsapi.ClassifyError(err)
+
+	switch kind {
+	case sessionsapi.KindUnavailable:
+		if s.unavailablePolicy(st) == options.UnavailablePolicyFailOpenStale {
+			ticketID, idErr := st.TicketID(req)
+			if idErr == nil {
+				if snapshot, ok := st.DegradedSnapshot(ticketID); ok {
+					scope.Session = snapshot
+					scope.SessionDegraded = true
+					logger.Errorf("session store unavailable, serving degraded last-known-good session for ticket %q: %v", shortTicketID(ticketID), err)
+					return false
+				}
+			}
+			logger.Errorf("session store unavailable and no degraded snapshot available, failing closed: %v", err)
+		} else {
+			logger.Errorf("session store unavailable, fail-closed policy rejecting request: %v", err)
+		}
+		// fail-closed, or fail-open-stale without a usable snapshot
+		rw.Header().Set("Retry-After", "2")
+		rw.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(rw, "session store temporarily unavailable, please retry shortly")
+		return true
+
+	case sessionsapi.KindRevoked:
+		// Deliberate invalidation: no Clear (the revocation record already
+		// exists), normal sign-in redirect with scope.Session == nil.
+		logger.Printf("session rejected: revoked: %v", err)
+		return false
+
+	case sessionsapi.KindCorrupt:
+		// The strict wrapper already destroyed the session and wrote an audit
+		// record; make sure the stale cookie is removed as well.
+		logger.Errorf("session rejected: corrupt: %v", err)
+		if clearErr := s.store.Clear(rw, req); clearErr != nil {
+			logger.Errorf("error clearing corrupt session cookie: %v", clearErr)
+		}
+		return false
+
+	case sessionsapi.KindNotFound:
+		// Natural expiry: no Clear and no audit alarm; normal sign-in redirect.
+		logger.Printf("session not found in store (natural expiry): %v", err)
+		return false
+
+	case sessionsapi.KindUnauthenticated:
+		// No cookie: plain unauthenticated request.
+		return false
+
+	default:
+		// Unclassified error in strict mode still must not destroy the
+		// session: reject until the condition clears rather than sign the user
+		// out.
+		logger.Errorf("unclassified session error, treating as unavailable: %v", err)
+		rw.Header().Set("Retry-After", "2")
+		rw.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(rw, "session handling error, please retry shortly")
+		return true
+	}
+}
+
+// shortTicketID returns a shortened, non-sensitive ticket identifier for logs.
+func shortTicketID(ticketID string) string {
+	if len(ticketID) <= 12 {
+		return ticketID
+	}
+	return ticketID[:12] + "…"
+}
+
 // getValidatedSession is responsible for loading a session and making sure
 // that it is valid.
 func (s *storedSessionLoader) getValidatedSession(rw http.ResponseWriter, req *http.Request) (*sessionsapi.SessionState, error) {
@@ -139,6 +277,13 @@ func (s *storedSessionLoader) getValidatedSession(rw http.ResponseWriter, req *h
 	if err != nil || session == nil {
 		// No session was found in the storage or error occurred, nothing more to do
 		return nil, err
+	}
+
+	// A degraded snapshot (fail-open-stale during a store outage) is served
+	// without refresh, re-validation or write-back: the store cannot be trusted
+	// for any of those operations right now.
+	if isDegraded(req.Context()) {
+		return session, nil
 	}
 
 	err = s.refreshSessionIfNeeded(rw, req, session)
@@ -223,9 +368,22 @@ func (s *storedSessionLoader) refreshSessionIfNeeded(rw http.ResponseWriter, req
 		if isFatalRefreshError(err) {
 			logger.Printf("Fatal refresh error detected (session revoked or invalid), clearing session for user: %s", session.User)
 
-			// Clear the session from storage (Redis) and remove the cookie
-			if err := s.store.Clear(rw, req); err != nil {
-				logger.Errorf("failed clearing session: %v", err)
+			if revoker, ok := s.store.(revoker); ok {
+				// Strict mode: record an auditable revocation with the provider
+				// reason rather than a plain cookie clear.
+				if revErr := revoker.Revoke(req, session, sessionsapi.ReasonRefreshTokenRevoked); revErr != nil {
+					logger.Errorf("failed revoking session: %v", revErr)
+				}
+				// Always clear the cookie so the user is sent to re-authenticate
+				// even if the revocation record could not be written yet.
+				if clearErr := s.store.Clear(rw, req); clearErr != nil {
+					logger.Errorf("failed clearing session cookie: %v", clearErr)
+				}
+			} else {
+				// Clear the session from storage (Redis) and remove the cookie
+				if err := s.store.Clear(rw, req); err != nil {
+					logger.Errorf("failed clearing session: %v", err)
+				}
 			}
 
 			// Return error immediately to force re-authentication
@@ -277,6 +435,14 @@ func (s *storedSessionLoader) refreshSession(rw http.ResponseWriter, req *http.R
 	err = s.store.Save(rw, req, session)
 	if err != nil {
 		logger.PrintAuthf(session.Email, req, logger.AuthError, "error saving session: %v", err)
+		if _, strict := s.strictEnabled(); strict && errors.Is(err, sessionsapi.ErrStoreUnavailable) {
+			// The write failed but the established login must not be destroyed:
+			// keep serving with the in-memory session state. The strict store
+			// already retried and left the old stored value untouched; the next
+			// successful request will persist the refreshed state.
+			logger.Printf("session write unavailable, preserving existing login for user %q", session.User)
+			return nil
+		}
 		return fmt.Errorf("error saving session: %v", err)
 	}
 	return nil

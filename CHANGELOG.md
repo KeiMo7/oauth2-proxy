@@ -2,11 +2,44 @@
 
 ## Release Highlights
 
+- Optional **strict session semantics** (`--session-strict-semantics`, off by
+  default) that distinguish a temporarily unavailable session store from an
+  unauthenticated request, so a Redis blip or failover no longer signs users
+  out.
+
 ## Important Notes
+
+- Strict semantics are disabled by default and all defaults preserve the
+  previous behaviour. Existing session/ticket serialization is unchanged;
+  upgrading does not invalidate live sessions.
+- A new `memory` session store type formalizes the in-process backend. It is
+  per-process and unsuitable for multi-replica deployments; shared semantics
+  require Redis.
 
 ## Breaking Changes
 
 ## Changes since v7.15.6
+
+- Classified session errors into `not_found` (natural expiry), `unavailable`
+  (retryable store failure), `corrupt` (undecodable payload, destroyed +
+  audited) and `revoked` (deliberate invalidation with a reason code);
+  `http.ErrNoCookie` remains the "not logged in" signal.
+- Added the `fail-closed` (503 + `Retry-After`) and `fail-open-stale` (serve
+  the last known good session without refreshing or writing it back)
+  unavailable policies, selectable via `--session-unavailable-policy`.
+- Store operations now use per-attempt timeouts and jittered retries; logout
+  has a dedicated, larger retry budget and never reports success until the
+  store-side deletion is confirmed, keeping the cookie on failure so the user
+  can retry.
+- Shared revocation records (`--session-revocation-enabled`) make logout and
+  administrative/provider-driven invalidation effective on every replica, and
+  separate revocation audit events from natural TTL expiry.
+- Added `--session-userinfo-stale-max-age` to re-validate embedded user
+  information upstream and revoke the session when permissions are withdrawn,
+  instead of waiting for expiry.
+- Added an in-memory session backend (`--session-store-type=memory`) reusing
+  the persistence ticket/encryption path, primarily for single-replica and
+  test use.
 
 # V7.15.6
 

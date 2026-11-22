@@ -46,6 +46,12 @@ type RequestScope struct {
 	// it was loaded or not.
 	SessionRevalidated bool
 
+	// SessionDegraded is set when strict session semantics are enabled and the
+	// request is being served from a last-known-good session snapshot because
+	// the backing store was temporarily unavailable (fail-open-stale policy).
+	// A degraded session must not be refreshed or written back.
+	SessionDegraded bool
+
 	// Upstream tracks which upstream was used for this request
 	Upstream string
 }

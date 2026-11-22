@@ -3,6 +3,7 @@ package options
 import (
 	"crypto"
 	"net/url"
+	"time"
 
 	ipapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/ip"
 	internaloidc "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/providers/oidc"
@@ -161,6 +162,14 @@ func NewFlagSet() *pflag.FlagSet {
 	flagSet.Bool("redis-use-cluster", false, "Connect to redis cluster. Must set --redis-cluster-connection-urls to use this feature")
 	flagSet.StringSlice("redis-cluster-connection-urls", []string{}, "List of Redis cluster connection URLs (eg redis://[USER[:PASSWORD]@]HOST[:PORT]). Used in conjunction with --redis-use-cluster")
 	flagSet.Int("redis-connection-idle-timeout", 0, "Redis connection idle timeout seconds, if Redis timeout option is non-zero, the --redis-connection-idle-timeout must be less then Redis timeout option")
+	flagSet.Bool("session-strict-semantics", false, "enable strict session semantics: classify store-unavailable separately from not-logged-in, retry timed-out operations, shared revocation records and reliable logout")
+	flagSet.String("session-unavailable-policy", "fail-closed", "behaviour when the session store is unavailable: 'fail-closed' rejects requests (503), 'fail-open-stale' serves the last known good session without refreshing or writing it back")
+	flagSet.Duration("session-operation-timeout", 2*time.Second, "per-attempt timeout for a single session store operation in strict mode")
+	flagSet.Int("session-operation-max-retries", 3, "retries (with backoff) for transient session store failures in strict mode")
+	flagSet.Int("session-logout-max-retries", 5, "retry budget for logout writes in strict mode; logout never reports success until the store deletion is confirmed")
+	flagSet.Bool("session-revocation-enabled", false, "store shared revocation records so logout and administrative revocation take effect on every replica")
+	flagSet.Duration("session-revocation-ttl", 0, "retention duration for revocation records; defaults to the cookie expire duration")
+	flagSet.Duration("session-userinfo-stale-max-age", 0, "maximum age of the user information embedded in a session before it is re-validated upstream; 0 disables and keeps the wait-for-expiry behaviour")
 	flagSet.String("signature-key", "", "GAP-Signature request signature key (algorithm:secretkey)")
 	flagSet.Bool("gcp-healthchecks", false, "Enable GCP/GKE healthcheck endpoints")
 
