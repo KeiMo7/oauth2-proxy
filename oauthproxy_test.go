@@ -632,6 +632,57 @@ func TestOAuthCallbackClientIPLogging(t *testing.T) {
 	}
 }
 
+func TestOAuthCallbackForwardedClientIPLogging(t *testing.T) {
+	test, err := NewPassAccessTokenTest(PassAccessTokenTestOptions{ValidToken: true})
+	require.NoError(t, err)
+	t.Cleanup(test.Close)
+	t.Cleanup(func() { logger.SetErrOutput(ginkgo.GinkgoWriter) })
+	test.proxy.sessionStore = failingSaveSessionStore{test.proxy.sessionStore}
+	test.proxy.realClientIPParser, err = ip.GetRealClientIPParser("Forwarded")
+	require.NoError(t, err)
+	trustedProxies, err := ip.ParseNetSet([]string{"192.0.2.0/24"})
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name         string
+		remoteAddr   string
+		headerValues []string
+		expected     string
+		notExpected  []string
+	}{
+		{"Untrusted peer", "198.51.100.23:1234", []string{"for=10.0.0.5"}, "198.51.100.23", []string{"10.0.0.5"}},
+		{"Appending trusted proxy", "192.0.2.10:1234", []string{"for=10.0.0.5", "for=198.51.100.23, for=192.0.2.20"}, "192.0.2.10 (198.51.100.23)", []string{"10.0.0.5"}},
+		{"Obfuscated node", "192.0.2.10:1234", []string{"for=_hidden"}, "192.0.2.10", []string{"_hidden"}},
+		{"Syntax error", "192.0.2.10:1234", []string{`for="198.51.100.23`}, "192.0.2.10", []string{"198.51.100.23"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			csrf, err := cookies.NewCSRF(test.proxy.CookieOptions, "")
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodGet, "/oauth2/callback?code=callback_code&state="+encodeState(csrf.HashOAuthState(), "%2F", false), nil)
+			req.RemoteAddr = tc.remoteAddr
+			for _, value := range tc.headerValues {
+				req.Header.Add("Forwarded", value)
+			}
+			req = middlewareapi.AddRequestScope(req, &middlewareapi.RequestScope{
+				ReverseProxy:   true,
+				TrustedProxies: trustedProxies,
+			})
+			csrfCookie, err := csrf.SetCookie(httptest.NewRecorder(), req)
+			require.NoError(t, err)
+			req.AddCookie(csrfCookie)
+			var output bytes.Buffer
+			logger.SetErrOutput(&output)
+			rw := httptest.NewRecorder()
+			test.proxy.OAuthCallback(rw, req)
+			assert.Equal(t, http.StatusInternalServerError, rw.Code)
+			assert.Contains(t, output.String(), "Error saving session state for "+tc.expected+": session save failed")
+			for _, fragment := range tc.notExpected {
+				assert.NotContains(t, output.String(), fragment)
+			}
+		})
+	}
+}
+
 type redeemErrorProvider struct {
 	*TestProvider
 	err error
@@ -2850,6 +2901,135 @@ func TestTrustedIPs(t *testing.T) {
 					}
 				})
 			}
+		})
+	}
+}
+
+func TestForwardedHeaderAcrossConsumers(t *testing.T) {
+	t.Cleanup(func() {
+		logger.SetOutput(ginkgo.GinkgoWriter)
+		logger.SetErrOutput(ginkgo.GinkgoWriter)
+		logger.SetAuthTemplate(logger.DefaultAuthLoggingFormat)
+		logger.SetReqTemplate(logger.DefaultRequestLoggingFormat)
+		logger.SetGetClientFunc(func(r *http.Request) string { return r.RemoteAddr })
+	})
+
+	tests := []struct {
+		name               string
+		trustedIPs         []string
+		remoteAddr         string
+		headerLines        []string
+		expectTrust        bool
+		expectedLog        string
+		expectedDiagnostic string
+	}{
+		{
+			name:               "single trusted proxy forwards the client",
+			trustedIPs:         []string{"198.51.100.23"},
+			remoteAddr:         "192.0.2.10:1234",
+			headerLines:        []string{"for=198.51.100.23"},
+			expectTrust:        true,
+			expectedLog:        "198.51.100.23",
+			expectedDiagnostic: "192.0.2.10 (198.51.100.23)",
+		},
+		{
+			name:               "spoofed leftmost entry is ignored by every consumer",
+			trustedIPs:         []string{"10.0.0.0/8"},
+			remoteAddr:         "192.0.2.10:1234",
+			headerLines:        []string{"for=10.9.9.9, for=198.51.100.23, for=192.0.2.20"},
+			expectTrust:        false,
+			expectedLog:        "198.51.100.23",
+			expectedDiagnostic: "192.0.2.10 (198.51.100.23)",
+		},
+		{
+			name:               "untrusted peer only ever sees the transport address",
+			trustedIPs:         []string{"198.51.100.23"},
+			remoteAddr:         "203.0.113.99:1234",
+			headerLines:        []string{"for=198.51.100.23"},
+			expectTrust:        false,
+			expectedLog:        "203.0.113.99",
+			expectedDiagnostic: "203.0.113.99",
+		},
+		{
+			name:               "untrusted peer decision uses the transport address too",
+			trustedIPs:         []string{"203.0.113.99"},
+			remoteAddr:         "203.0.113.99:1234",
+			headerLines:        []string{"for=198.51.100.23"},
+			expectTrust:        true,
+			expectedLog:        "203.0.113.99",
+			expectedDiagnostic: "203.0.113.99",
+		},
+		{
+			name:               "syntax error degrades every consumer to the transport address",
+			trustedIPs:         []string{"198.51.100.23"},
+			remoteAddr:         "192.0.2.10:1234",
+			headerLines:        []string{`for="198.51.100.23`},
+			expectTrust:        false,
+			expectedLog:        "192.0.2.10",
+			expectedDiagnostic: "192.0.2.10",
+		},
+		{
+			name:               "no trustworthy node degrades every consumer to the transport address",
+			trustedIPs:         []string{"198.51.100.23"},
+			remoteAddr:         "192.0.2.10:1234",
+			headerLines:        []string{"for=_hidden"},
+			expectTrust:        false,
+			expectedLog:        "192.0.2.10",
+			expectedDiagnostic: "192.0.2.10",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opts := baseTestOptions()
+			opts.UpstreamServers = options.UpstreamConfig{
+				Upstreams: []options.Upstream{
+					{
+						ID:     "static",
+						Path:   "/",
+						Static: ptr.To(true),
+					},
+				},
+			}
+			opts.TrustedIPs = test.trustedIPs
+			opts.TrustedProxyIPs = []string{"192.0.2.0/24"}
+			opts.ReverseProxy = true
+			opts.RealClientIPHeader = "Forwarded"
+			opts.Logging.AuthFormat = "{{.Client}}"
+			opts.Logging.RequestFormat = "{{.Client}}"
+			require.NoError(t, validation.Validate(opts))
+
+			proxy, err := NewOAuthProxy(opts, func(string) bool { return true })
+			require.NoError(t, err)
+
+			trustedProxies, err := ip.ParseNetSet(opts.TrustedProxyIPs)
+			require.NoError(t, err)
+
+			newRequest := func() *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.RemoteAddr = test.remoteAddr
+				for _, line := range test.headerLines {
+					req.Header.Add("Forwarded", line)
+				}
+				return middlewareapi.AddRequestScope(req, &middlewareapi.RequestScope{
+					ReverseProxy:   true,
+					TrustedProxies: trustedProxies,
+				})
+			}
+
+			// 1. Allowlist decision for source-based access.
+			assert.Equal(t, test.expectTrust, proxy.isTrustedIP(newRequest()))
+
+			// 2. Authentication log and 3. request log.
+			req := newRequest()
+			var output bytes.Buffer
+			logger.SetOutput(&output)
+			logger.PrintAuthf("", req, logger.AuthFailure, "denied")
+			logger.PrintReq("", "", req, *req.URL, time.Now(), http.StatusForbidden, 0)
+			assert.Equal(t, test.expectedLog+"\n"+test.expectedLog+"\n", output.String())
+
+			// 4. Callback diagnostics use the same resolved address.
+			assert.Equal(t, test.expectedDiagnostic, middlewareapi.ClientString(req, proxy.realClientIPParser, true))
 		})
 	}
 }

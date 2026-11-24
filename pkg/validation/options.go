@@ -88,17 +88,11 @@ func Validate(o *options.Options) error {
 		}
 		o.SetRealClientIPParser(parser)
 
-		// Allow the logger to get client IPs
+		// Allow the logger to get client IPs. Auth logs, request logs, the
+		// trusted-IP allowlist and callback diagnostics all resolve through the
+		// same request-scoped path so they always agree.
 		logger.SetGetClientFunc(func(r *http.Request) string {
-			parser := o.GetRealClientIPParser()
-			var trustedProxies *ip.NetSet
-			scope := middlewareapi.GetRequestScope(r)
-			if scope != nil && scope.CanTrustForwardedHeaders(r) {
-				trustedProxies = scope.TrustedProxies
-			} else {
-				parser = nil
-			}
-			return ip.GetClientString(parser, r, trustedProxies, false)
+			return middlewareapi.ClientString(r, o.GetRealClientIPParser(), false)
 		})
 	}
 

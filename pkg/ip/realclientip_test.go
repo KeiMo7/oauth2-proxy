@@ -13,6 +13,7 @@ import (
 
 func TestGetRealClientIPParser(t *testing.T) {
 	forwardedForType := reflect.TypeOf((*xForwardedForClientIPParser)(nil))
+	forwardedType := reflect.TypeOf((*forwardedClientIPParser)(nil))
 
 	tests := []struct {
 		header     string
@@ -24,8 +25,9 @@ func TestGetRealClientIPParser(t *testing.T) {
 		{"x-proxyuser-ip", "", forwardedForType},
 		{"x-envoy-external-address", "", forwardedForType},
 		{"cf-connecting-ip", "", forwardedForType},
+		{"Forwarded", "", forwardedType},
+		{"forwarded", "", forwardedType},
 		{"", "the http header key () is either invalid or unsupported", nil},
-		{"Forwarded", "the http header key (Forwarded) is either invalid or unsupported", nil},
 		{"2#* @##$$:kd", "the http header key (2#* @##$$:kd) is either invalid or unsupported", nil},
 	}
 
@@ -48,6 +50,9 @@ func TestGetRealClientIPParser(t *testing.T) {
 
 		if xp, ok := p.(*xForwardedForClientIPParser); ok {
 			assert.Equal(t, http.CanonicalHeaderKey(test.header), xp.header)
+		}
+		if fp, ok := p.(*forwardedClientIPParser); ok {
+			assert.Equal(t, http.CanonicalHeaderKey(test.header), fp.header)
 		}
 	}
 }

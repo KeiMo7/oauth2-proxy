@@ -214,6 +214,27 @@ to `10.0.0.5, 198.51.100.23`, the client is `198.51.100.23`, not the potentially
 forged `10.0.0.5`. For single-value headers such as `X-Real-IP`, configure the
 edge proxy to overwrite any value supplied by the client.
 
+The standardized `Forwarded` header ([RFC 7239](https://www.rfc-editor.org/rfc/rfc7239))
+is also supported and follows the same trust rules: only elements from trusted
+peers are read, repeated header fields are merged in the order received, and the
+chain is walked from right to left skipping trusted proxy addresses. Parameter
+names are case-insensitive and may appear in any order; `by`, `proto`, `host`
+and extension parameters are accepted alongside `for`, and an element that only
+carries some of them still parses. Unknown parameters are ignored, while a
+duplicate `for` parameter (or two `for` values in one element) is rejected as
+ambiguous; repeated values of parameters that do not affect the client address
+are ignored. Quoted values may contain commas, semicolons, colons, brackets and
+escaped characters. Elements whose identifier is `unknown` or starts with `_`
+are obfuscated and cannot be used as a client address; nothing to the left of
+such a hop is trusted. If the `Forwarded` header is missing or contains no
+trustworthy node, the traditional `X-Forwarded-For` header is tried under the
+same trust premise, followed by the transport address; the two headers are never
+combined into a single chain. A malformed `Forwarded` header is reported as an
+error rather than silently replaced: logs and callback diagnostics show only the
+transport address, and a malformed header never grants a `--trusted-ip`
+exemption. When `X-Forwarded-For` is the configured header, OAuth2 Proxy never
+consults `Forwarded`.
+
 If every address in the chain is in a trusted proxy range, the leftmost address
 is used for compatibility. Leaving `--trusted-proxy-ip` unset trusts all IPv4 and
 IPv6 addresses, so it retains this leftmost behavior and does **not** protect
@@ -242,7 +263,7 @@ client-IP headers, with the same XFF chain resolution.
 | flag: `--htpasswd-file`<br/>toml: `htpasswd_file`                             | string         | additionally authenticate against a htpasswd file. Entries must be created with `htpasswd -B` for bcrypt encryption                                                                                                                                                                                                                                                                                                                                                                                                   |             |
 | flag: `--htpasswd-user-group`<br/>toml: `htpasswd_user_groups`                | string \| list | the groups to be set on sessions for htpasswd users                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |             |
 | flag: `--proxy-prefix`<br/>toml: `proxy_prefix`                               | string         | the url root path that this proxy should be nested under (e.g. /`<oauth2>/sign_in`)                                                                                                                                                                                                                                                                                                                                                                                                                                   | `"/oauth2"` |
-| flag: `--real-client-ip-header`<br/>toml: `real_client_ip_header`             | string         | Header used to determine the real IP of the client when the direct caller matches `--trusted-proxy-ip`; requires `--reverse-proxy` (one of: X-Forwarded-For, X-Real-IP, X-ProxyUser-IP, X-Envoy-External-Address, or CF-Connecting-IP)                                                                                                                                                                                                                                                                                  | X-Real-IP   |
+| flag: `--real-client-ip-header`<br/>toml: `real_client_ip_header`             | string         | Header used to determine the real IP of the client when the direct caller matches `--trusted-proxy-ip`; requires `--reverse-proxy` (one of: X-Forwarded-For, X-Real-IP, X-ProxyUser-IP, X-Envoy-External-Address, CF-Connecting-IP, or the standardized Forwarded header)                                                                                                                                                                                                                                                                                  | X-Real-IP   |
 | flag: `--redirect-url`<br/>toml: `redirect_url`                               | string         | the OAuth Redirect URL, e.g. `"https://internalapp.yourcompany.com/oauth2/callback"`                                                                                                                                                                                                                                                                                                                                                                                                                                  |             |
 | flag: `--relative-redirect-url`<br/>toml: `relative_redirect_url`             | bool           | allow relative OAuth Redirect URL.`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | false       |
 | flag: `--reverse-proxy`<br/>toml: `reverse_proxy`                             | bool           | are we running behind a reverse proxy, controls whether headers like X-Real-IP are accepted and allows X-Forwarded-\{Proto,Host,Uri\} headers to be used on redirect selection                                                                                                                                                                                                                                                                                                                                        | false       |

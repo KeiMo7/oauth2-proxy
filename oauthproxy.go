@@ -639,14 +639,7 @@ func (p *OAuthProxy) isTrustedIP(req *http.Request) bool {
 		return false
 	}
 
-	var remoteAddr net.IP
-	var err error
-	scope := middlewareapi.GetRequestScope(req)
-	if scope != nil && scope.CanTrustForwardedHeaders(req) {
-		remoteAddr, err = ip.GetClientIPFromTrustedProxy(p.realClientIPParser, req, scope.TrustedProxies)
-	} else {
-		remoteAddr, err = ip.GetClientIP(nil, req)
-	}
+	remoteAddr, err := middlewareapi.ResolveRealClientIP(req, p.realClientIPParser)
 	if err != nil {
 		logger.Errorf("Error obtaining real IP for trusted IP list: %v", err)
 		return false
@@ -898,15 +891,7 @@ func (p *OAuthProxy) doOAuthStart(rw http.ResponseWriter, req *http.Request, ove
 // OAuthCallback is the OAuth2 authentication flow callback that finishes the
 // OAuth2 authentication flow
 func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
-	realClientIPParser := p.realClientIPParser
-	var trustedProxies *ip.NetSet
-	scope := middlewareapi.GetRequestScope(req)
-	if scope != nil && scope.CanTrustForwardedHeaders(req) {
-		trustedProxies = scope.TrustedProxies
-	} else {
-		realClientIPParser = nil
-	}
-	remoteAddr := ip.GetClientString(realClientIPParser, req, trustedProxies, true)
+	remoteAddr := middlewareapi.ClientString(req, p.realClientIPParser, true)
 
 	// finish the oauth cycle
 	// #nosec G120 -- The default max size in Go is already capped at 10MB so this would be the absolute max and is

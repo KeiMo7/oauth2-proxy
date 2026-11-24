@@ -1,6 +1,7 @@
 package ip
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -9,20 +10,38 @@ import (
 	ipapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/ip"
 )
 
+const (
+	xForwardedForHeader = "X-Forwarded-For"
+	forwardedHeader     = "Forwarded"
+)
+
+var (
+	// ErrMalformedForwardedHeader is returned when the standardized Forwarded
+	// header does not conform to its grammar (unterminated quotes, missing
+	// separators or values, duplicate or unparsable source addresses).
+	ErrMalformedForwardedHeader = errors.New("malformed Forwarded header")
+
+	// ErrNoTrustworthyClientIP is returned when a forwarding chain contains no
+	// element that may be treated as the client address. This is the case for
+	// obfuscated node identifiers and for hops without a source address.
+	ErrNoTrustworthyClientIP = errors.New("Forwarded header contains no trustworthy client address")
+)
+
 func GetRealClientIPParser(headerKey string) (ipapi.RealClientIPParser, error) {
 	headerKey = http.CanonicalHeaderKey(headerKey)
 
 	switch headerKey {
-	case http.CanonicalHeaderKey("X-Forwarded-For"),
+	case http.CanonicalHeaderKey(xForwardedForHeader),
 		http.CanonicalHeaderKey("X-Real-IP"),
 		http.CanonicalHeaderKey("X-ProxyUser-IP"),
 		http.CanonicalHeaderKey("X-Envoy-External-Address"),
 		// Cloudflare specific Real-IP header
 		http.CanonicalHeaderKey("CF-Connecting-IP"):
 		return &xForwardedForClientIPParser{header: headerKey}, nil
+	case http.CanonicalHeaderKey(forwardedHeader):
+		return &forwardedClientIPParser{header: headerKey}, nil
 	}
 
-	// TODO: implement the more standardized but more complex `Forwarded` header.
 	return nil, fmt.Errorf("the http header key (%s) is either invalid or unsupported", headerKey)
 }
 
@@ -55,28 +74,50 @@ func (p xForwardedForClientIPParser) GetRealClientIP(h http.Header) (net.IP, err
 
 // GetClientIPFromTrustedProxy obtains the client IP from a header supplied by
 // a caller that has already been verified as a trusted proxy.
+//
+// The standardized Forwarded header and the traditional X-Forwarded-For header
+// share one right-to-left trust walk. When Forwarded is the configured header
+// and it is absent or contains no trustworthy node, the traditional header is
+// tried under the same trust premise before the caller falls back to the
+// transport address. The two headers are never merged into a single chain.
 func GetClientIPFromTrustedProxy(p ipapi.RealClientIPParser, req *http.Request, trustedProxies *NetSet) (net.IP, error) {
 	if p == nil {
 		return nil, fmt.Errorf("real client IP parser is required")
 	}
 
-	xffParser, ok := p.(*xForwardedForClientIPParser)
-	if !ok || xffParser.header != http.CanonicalHeaderKey("X-Forwarded-For") {
+	switch parser := p.(type) {
+	case *forwardedClientIPParser:
+		if trustedProxies == nil {
+			return nil, fmt.Errorf("trusted proxy list is required to parse Forwarded")
+		}
+		return getForwardedClientIP(req, trustedProxies)
+	case *xForwardedForClientIPParser:
+		if parser.header != http.CanonicalHeaderKey(xForwardedForHeader) {
+			return p.GetRealClientIP(req.Header)
+		}
+		if trustedProxies == nil {
+			return nil, fmt.Errorf("trusted proxy list is required to parse X-Forwarded-For")
+		}
+		return getXForwardedForClientIP(req, parser.header, trustedProxies)
+	default:
 		return p.GetRealClientIP(req.Header)
 	}
+}
 
-	if trustedProxies == nil {
-		return nil, fmt.Errorf("trusted proxy list is required to parse X-Forwarded-For")
-	}
-
-	xff := strings.Join(req.Header.Values(xffParser.header), ",")
+// getXForwardedForClientIP walks a traditional X-Forwarded-For chain from right
+// to left, combining repeated fields in their received order and skipping
+// addresses covered by the trust mask. The first untrusted address is the
+// client; entries to its left are never consulted. If the whole chain is
+// trusted, the leftmost entry is retained for compatibility.
+func getXForwardedForClientIP(req *http.Request, header string, trustedProxies *NetSet) (net.IP, error) {
+	xff := strings.Join(req.Header.Values(header), ",")
 	if xff == "" {
 		return nil, nil
 	}
 
 	chain := strings.Split(xff, ",")
 	for i := len(chain) - 1; i >= 0; i-- {
-		clientIP, err := parseClientIP(chain[i], xffParser.header)
+		clientIP, err := parseClientIP(chain[i], header)
 		if err != nil {
 			return nil, err
 		}
@@ -130,19 +171,35 @@ func getRemoteIP(req *http.Request) (net.IP, error) {
 	//revive:enable:indent-error-flow
 }
 
+// GetRemoteIP obtains the IP of the low-level connected network host.
+func GetRemoteIP(req *http.Request) (net.IP, error) {
+	return getRemoteIP(req)
+}
+
 // GetClientString obtains the human readable string of the remote IP and optionally
 // the real client IP. Callers must pass a nil parser unless the peer is trusted.
 // Missing or invalid client headers leave only the transport IP in the output.
 func GetClientString(p ipapi.RealClientIPParser, req *http.Request, trustedProxies *NetSet, full bool) (s string) {
-	var realClientIPStr string
+	var realClientIP net.IP
 	if p != nil {
-		if realClientIP, err := GetClientIPFromTrustedProxy(p, req, trustedProxies); err == nil && realClientIP != nil {
-			realClientIPStr = realClientIP.String()
+		if parsed, err := GetClientIPFromTrustedProxy(p, req, trustedProxies); err == nil {
+			realClientIP = parsed
 		}
 	}
 
-	var remoteIPStr string
-	if remoteIP, err := getRemoteIP(req); err == nil && remoteIP != nil {
+	remoteIP, _ := getRemoteIP(req)
+	return FormatClientString(realClientIP, remoteIP, full)
+}
+
+// FormatClientString renders the resolved client address and the transport
+// address consistently for auth logs, request logs and callback diagnostics.
+// Invalid (nil) addresses are omitted rather than rendered.
+func FormatClientString(realClientIP, remoteIP net.IP, full bool) string {
+	var realClientIPStr, remoteIPStr string
+	if realClientIP != nil {
+		realClientIPStr = realClientIP.String()
+	}
+	if remoteIP != nil {
 		remoteIPStr = remoteIP.String()
 	}
 
@@ -150,6 +207,12 @@ func GetClientString(p ipapi.RealClientIPParser, req *http.Request, trustedProxi
 		return realClientIPStr
 	}
 	if full && realClientIPStr != "" {
+		if realClientIPStr == remoteIPStr {
+			// The resolved address is the transport peer (for example after the
+			// documented fallback to the transport address). Do not render it
+			// twice.
+			return remoteIPStr
+		}
 		return fmt.Sprintf("%s (%s)", remoteIPStr, realClientIPStr)
 	}
 	return remoteIPStr

@@ -2,6 +2,9 @@
 
 ## Release Highlights
 
+- Support the standardized `Forwarded` header (RFC 7239) for `--real-client-ip-header`,
+  resolved through the same trusted-proxy parsing and trust path as `X-Forwarded-For`.
+
 ## Important Notes
 
 ## Breaking Changes

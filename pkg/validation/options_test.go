@@ -207,14 +207,21 @@ func TestRealClientIPHeader(t *testing.T) {
 	assert.Equal(t, nil, Validate(o))
 	assert.NotNil(t, o.GetRealClientIPParser())
 
-	// Ensure unknown header format process an error.
+	// Ensure the standardized Forwarded header is accepted.
 	o = testOptions()
 	o.ReverseProxy = true
 	o.RealClientIPHeader = "Forwarded"
+	assert.Equal(t, nil, Validate(o))
+	assert.NotNil(t, o.GetRealClientIPParser())
+
+	// Ensure unknown header format process an error.
+	o = testOptions()
+	o.ReverseProxy = true
+	o.RealClientIPHeader = "X-Unknown-Forwarding-Header"
 	err := Validate(o)
 	assert.NotEqual(t, nil, err)
 	expected := errorMsg([]string{
-		"real_client_ip_header (Forwarded) not accepted parameter value: the http header key (Forwarded) is either invalid or unsupported",
+		"real_client_ip_header (X-Unknown-Forwarding-Header) not accepted parameter value: the http header key (X-Unknown-Forwarding-Header) is either invalid or unsupported",
 	})
 	assert.Equal(t, expected, err.Error())
 	assert.Nil(t, o.GetRealClientIPParser())
